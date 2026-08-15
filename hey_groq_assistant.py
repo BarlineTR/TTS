@@ -38,7 +38,9 @@ TTS_MIN_CHARS = 35
 TTS_MAX_CHARS = 180
 
 # ─── Audio ──────────────────────────────────────────────────────────────────
-audio_queue = queue.Queue(maxsize=32)
+# Ses çıkışını güvenilir tutuyoruz. Önceki sürümde MP3 pipe -> FFmpeg ->
+# PCM queue zinciri Jetson'daki bazı FFmpeg/PortAudio kombinasyonlarında
+# ses üretimini susturabiliyordu.
 audio_stop_event = threading.Event()
 audio_generation_lock = threading.Lock()
 current_audio_generation = 0
@@ -46,38 +48,15 @@ current_audio_generation = 0
 
 def next_audio_generation():
     global current_audio_generation
+
     with audio_generation_lock:
         current_audio_generation += 1
-        generation = current_audio_generation
-    try:
-        while True:
-            audio_queue.get_nowait()
-    except queue.Empty:
-        pass
-    return generation
+        return current_audio_generation
 
 
 def stop_audio():
     sd.stop()
     next_audio_generation()
-
-
-def audio_player_worker(out_id):
-    while not audio_stop_event.is_set():
-        try:
-            item = audio_queue.get(timeout=0.1)
-        except queue.Empty:
-            continue
-        if item is None:
-            continue
-        generation, sample_rate, pcm = item
-        with audio_generation_lock:
-            if generation != current_audio_generation:
-                continue
-        try:
-            sd.play(pcm, samplerate=sample_rate, device=out_id, blocking=True)
-        except Exception as exc:
-            print(f"\n  ⚠️ Audio playback: {exc}")
 
 
 # ─── Cihaz ──────────────────────────────────────────────────────────────────
@@ -156,65 +135,131 @@ def transcribe(groq_client, audio_np: np.ndarray) -> str:
 
 
 # ─── Streaming TTS ──────────────────────────────────────────────────────────
-async def _edge_stream_to_queue(text, generation):
-    """Edge-TTS audio stream -> FFmpeg stdin -> PCM stdout -> RAM queue."""
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-loglevel", "error",
-        "-f", "mp3", "-i", "pipe:0",
-        "-f", "s16le", "-acodec", "pcm_s16le",
-        "-ar", str(SAMPLE_RATE), "-ac", "1", "pipe:1",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    communicate = edge_tts.Communicate(text, EDGE_TTS_VOICE)
+def _edge_synthesize_sentence(text: str, out_id: int, generation: int):
+    """
+    Tüm cevabı değil, yalnızca hazır cümleyi TTS'ye gönderir.
 
-    async def write_audio():
-        try:
-            async for message in communicate.stream():
-                if message["type"] == "audio":
-                    proc.stdin.write(message["data"])
-                    await proc.stdin.drain()
-            proc.stdin.close()
-            await proc.stdin.wait_closed()
-        except Exception:
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-            raise
+    Böylece LLM:
+        cümle 1 -> TTS -> ses
+        cümle 2 -> TTS -> ses
+        ...
 
-    writer_task = asyncio.create_task(write_audio())
-    bytes_per_chunk = int(SAMPLE_RATE * 0.06 * 2)
+    şeklinde çalışır.
+
+    Burada Edge-TTS -> MP3 -> FFmpeg -> WAV -> sounddevice zincirini
+    koruyoruz. Bu, önceki pipe/PCM streaming sürümüne göre Jetson üzerinde
+    çok daha güvenilir ses çıkışı sağlar.
+    """
+    if not text.strip():
+        return
+
+    mp3_path = None
+    wav_path = None
+
     try:
-        while True:
-            data = await proc.stdout.read(bytes_per_chunk)
-            if not data:
-                break
-            pcm = np.frombuffer(data, dtype=np.int16).copy()
-            with audio_generation_lock:
-                if generation != current_audio_generation:
-                    break
-            await asyncio.to_thread(audio_queue.put, (generation, SAMPLE_RATE, pcm))
-        await writer_task
-        await proc.wait()
+        mp3_file = tempfile.NamedTemporaryFile(
+            suffix=".mp3",
+            delete=False
+        )
+        wav_file = tempfile.NamedTemporaryFile(
+            suffix=".wav",
+            delete=False
+        )
+
+        mp3_path = mp3_file.name
+        wav_path = wav_file.name
+
+        mp3_file.close()
+        wav_file.close()
+
+        loop = asyncio.new_event_loop()
+
+        try:
+            asyncio.set_event_loop(loop)
+
+            async def synthesize():
+                communicate = edge_tts.Communicate(
+                    text,
+                    EDGE_TTS_VOICE
+                )
+                await communicate.save(mp3_path)
+
+            loop.run_until_complete(synthesize())
+
+        finally:
+            loop.close()
+
+        with audio_generation_lock:
+            if generation != current_audio_generation:
+                return
+
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel", "error",
+                "-i", mp3_path,
+                "-ar", str(SAMPLE_RATE),
+                "-ac", "1",
+                "-f", "wav",
+                wav_path
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE
+        )
+
+        if result.returncode != 0:
+            error_text = result.stderr.decode(
+                "utf-8",
+                errors="replace"
+            ).strip()
+            raise RuntimeError(
+                f"FFmpeg TTS decode başarısız: {error_text}"
+            )
+
+        rate, data = wav.read(wav_path)
+
+        if data is None or len(data) == 0:
+            raise RuntimeError("TTS WAV verisi boş geldi.")
+
+        with audio_generation_lock:
+            if generation != current_audio_generation:
+                return
+
+        if data.dtype != np.int16:
+            data = data.astype(np.int16)
+
+        sd.play(
+            data,
+            samplerate=rate,
+            device=out_id,
+            blocking=True
+        )
+
+    except Exception as exc:
+        print(f"\n  ⚠️ TTS/playback hatası: {exc}")
+
     finally:
-        if not writer_task.done():
-            writer_task.cancel()
-        if proc.returncode is None:
-            proc.kill()
-            await proc.wait()
+        for path in (mp3_path, wav_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
 
 def speak_streaming(text: str, out_id: int, generation=None):
     if not text.strip():
         return
+
     if generation is None:
         generation = next_audio_generation()
-    try:
-        asyncio.run(_edge_stream_to_queue(text.strip(), generation))
-    except Exception as exc:
-        print(f"\n  ⚠️ TTS streaming hatası: {exc}")
+
+    _edge_synthesize_sentence(
+        text.strip(),
+        out_id,
+        generation
+    )
 
 
 def speak_once(text: str, out_id: int):
@@ -326,9 +371,6 @@ def main():
     print(f"  🗣️  TTS       : {EDGE_TTS_VOICE} (Streaming)")
     print(f"  🧠 LLM       : {LLM_MODEL}")
     print(f"  ⏱️  Timeout   : {CONVO_TIMEOUT_SECS}s\n")
-
-    player_thread = threading.Thread(target=audio_player_worker, args=(out_id,), daemon=True)
-    player_thread.start()
 
     print("  🔊 Başlangıç sesi...")
     speak_once("Hazırım. Hey Groq diyerek başlayın.", out_id)
