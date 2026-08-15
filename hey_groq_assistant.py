@@ -91,63 +91,36 @@ def audio_to_wav_file(audio_np: np.ndarray) -> str:
     return tmp.name
 
 
-# ─── Pipeline TTS (Önceden Sentezle, Eşzamanlı Çal) ─────────────────────────
-def _synthesize_worker(text_queue: queue.Queue, audio_queue: queue.Queue):
+# ─── Tek Çağrı TTS (Maksimum Akıcılık) ──────────────────────────────────────
+def _edge_synthesize_full(text: str, out_id: int):
     """
-    Arka plan thread: Metin kuyruğundan alır → Edge-TTS ile hemen sentezler
-    → WAV verisini audio_queue'ya koyar.
-    Bir sonraki cümleyi, önceki cümle daha çalınırken hazırlar.
+    Tüm yanıtı tek bir Edge-TTS çağrısıyla sentezler.
+    Tek ağ isteği → doğal prozodi → sıfır boşluk.
     """
-    while True:
-        item = text_queue.get()
-        if item is None:
-            audio_queue.put(None)  # Bitiş işareti
-            break
-        text = item
-        try:
-            mp3 = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-            wav_f = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            mp3.close(); wav_f.close()
-
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            async def _synth():
-                await edge_tts.Communicate(text, EDGE_TTS_VOICE).save(mp3.name)
-            loop.run_until_complete(_synth())
-            loop.close()
-
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", mp3.name,
-                 "-ar", str(SAMPLE_RATE), "-ac", "1", wav_f.name],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            rate, data = wav.read(wav_f.name)
-            os.unlink(mp3.name); os.unlink(wav_f.name)
-            audio_queue.put((rate, data))
-        except Exception as e:
-            print(f"\n  ⚠️ Sentez hatası: {e}")
-            audio_queue.put(None)
+    mp3 = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+    wf  = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    mp3.close(); wf.close()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    async def _s():
+        await edge_tts.Communicate(text, EDGE_TTS_VOICE).save(mp3.name)
+    loop.run_until_complete(_s()); loop.close()
+    subprocess.run(["ffmpeg", "-y", "-i", mp3.name,
+                    "-ar", str(SAMPLE_RATE), "-ac", "1", wf.name],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    rate, data = wav.read(wf.name)
+    os.unlink(mp3.name); os.unlink(wf.name)
+    sd.play(data, samplerate=rate, device=out_id)
+    sd.wait()
 
 
 def stream_and_speak_pipeline(groq_client, messages, out_id):
     """
-    LLM akışı + Pipeline TTS:
-    - Sentezleyici thread  : cümle hazır olur olmaz Edge-TTS'e gönderir
-    - Ana thread (oynatıcı): önceki ses biterken sonraki zaten hazır
-    Sonuç: cümleler arası boşluk ~0
+    1. LLM akışıyla tüm yanıtı topla (metin terminale canlı yazılır)
+    2. Tamamlanan yanıtı tek Edge-TTS çağrısıyla seslendir → boşluksuz, akıcı
     """
-    text_queue  = queue.Queue()
-    audio_queue = queue.Queue(maxsize=2)  # Max 2 cümle önceden hazırla
-
-    synth_thread = threading.Thread(
-        target=_synthesize_worker, args=(text_queue, audio_queue), daemon=True
-    )
-    synth_thread.start()
-
     full_response = ""
-    buffer = ""
 
-    # LLM Streaming
     stream = groq_client.chat.completions.create(
         messages=messages,
         model="llama-3.3-70b-versatile",
@@ -155,34 +128,18 @@ def stream_and_speak_pipeline(groq_client, messages, out_id):
         stream=True
     )
 
+    sys.stdout.write("  🤖 ")
     for chunk in stream:
         token = chunk.choices[0].delta.content or ""
         full_response += token
-        buffer += token
+        sys.stdout.write(token)
+        sys.stdout.flush()
+    print()  # Yeni satır
 
-        if any(p in buffer for p in ['.', '?', '!', '\n']):
-            sentence = buffer.strip()
-            buffer = ""
-            if sentence:
-                print(f"  🤖 {sentence}")
-                text_queue.put(sentence)
+    # Tüm yanıtı tek seferde seslendir (maksimum akıcılık)
+    if full_response.strip():
+        _edge_synthesize_full(full_response.strip(), out_id)
 
-    if buffer.strip():
-        print(f"  🤖 {buffer.strip()}")
-        text_queue.put(buffer.strip())
-
-    text_queue.put(None)  # Sentezleyiciyi durdur
-
-    # Ses oynatma: audio_queue'dan al → çal (sentez zaten hazır)
-    while True:
-        item = audio_queue.get()
-        if item is None:
-            break
-        rate, data = item
-        sd.play(data, samplerate=rate, device=out_id)
-        sd.wait()
-
-    synth_thread.join()
     return full_response
 # ─────────────────────────────────────────────────────────────────────────────
 
