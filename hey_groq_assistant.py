@@ -14,13 +14,6 @@ if sys.platform == 'win32':
 
 os.environ["COQUI_TOS_AGREED"] = "1"
 
-# GROQ API KEY Sabit Tanımlama (Buraya Kendi Anahtarınızı Girin)
-DEFAULT_GROQ_API_KEY = "gsk_SİZİN_GROQ_API_KEYİNİZ"
-
-# Eğer sistem ortam değişkeninde yoksa sabit key'i kullan
-if "GROQ_API_KEY" not in os.environ and DEFAULT_GROQ_API_KEY != "gsk_SİZİN_GROQ_API_KEYİNİZ":
-    os.environ["GROQ_API_KEY"] = DEFAULT_GROQ_API_KEY
-
 def find_respeaker_devices():
     devices = sd.query_devices()
     input_id = None
@@ -41,15 +34,13 @@ def find_respeaker_devices():
         
     return input_id, output_id
 
-def record_stream_audio(duration=3, samplerate=16000, device_id=0):
-    """Sürekli dinleme için kısa ses dilimi kaydeder"""
+def record_stream_audio(duration=2.5, samplerate=16000, device_id=0):
     audio = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=1, dtype='int16', device=device_id)
     sd.wait()
     wav.write("wakeword_input.wav", samplerate, audio)
     return "wakeword_input.wav"
 
 def record_user_speech(duration=5, samplerate=16000, device_id=0):
-    """Wake word algılandıktan sonra kullanıcının komutunu kaydeder"""
     audio = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=1, dtype='int16', device=device_id)
     sd.wait()
     wav.write("user_command.wav", samplerate, audio)
@@ -69,7 +60,7 @@ def clean_text_for_tts(text):
 
 def main():
     print("==================================================")
-    print("🎙️ Wake-Word 'Hey Groq' Canlı Sesli Asistan")
+    print("🎙️ Wake-Word 'Hey Groq' Canlı Sesli Asistan (Görsel Loglu)")
     print("==================================================")
     
     groq_api_key = os.environ.get("GROQ_API_KEY")
@@ -83,7 +74,7 @@ def main():
     
     print("\n⚡ TTS Modeli Yükleniyor...")
     tts = TTS(model_name="tts_models/tr/common-voice/glow-tts", progress_bar=False, gpu=False)
-    print("✅ Asistan Hazır! ReSpeaker Mikrofonuna 'Hey Groq' Demenizi Bekliyor...")
+    print("✅ Asistan Hazır! ReSpeaker Mikrofonuna 'Hey Groq' Demenizi Bekliyor...\n")
 
     target_sample_rate = 16000
     messages_history = [
@@ -93,11 +84,14 @@ def main():
         }
     ]
 
-    wake_words = ["hey groq", "hey grup", "hey krog", "hi groq", "groq", "grup"]
+    wake_words = ["hey groq", "hey grup", "hey krog", "hi groq", "groq", "grup", "grok", "hey grok"]
 
     while True:
         try:
-            # 1. Sürekli Arka Planda Dinle (Wake-Word Algılama)
+            # Arka plan dinlemesi görselleştirme
+            sys.stdout.write("👂 [Ortam Dinleniyor... Sayın: 'Hey Groq']\r")
+            sys.stdout.flush()
+
             chunk_file = record_stream_audio(duration=2.5, samplerate=16000, device_id=input_id)
             
             with open(chunk_file, "rb") as file:
@@ -109,13 +103,14 @@ def main():
                 )
 
             heard_text = str(transcription).strip().lower()
-            
-            # 2. 'Hey Groq' Uyandırma Kelimesi Algılandı mı?
+            if heard_text:
+                print(f"\n🔍 Algılanan Ortam Sesi: \"{heard_text}\"")
+
+            # Wake-word kontrolü
             if any(word in heard_text for word in wake_words):
-                print(f"\n✨ WAKE-WORD ALGILANDI! ({heard_text})")
-                print("🔊 Dinliyorum bip sesi (Sizi dinliyor, emrinizi verin)...")
+                print(f"\n✨ WAKE-WORD ALGILANDI! (Duyulan: '{heard_text}')")
+                print("🔊 'Dinliyorum seni'...")
                 
-                # 'Dinliyorum' geri bildirimi
                 ack_wav = "ack.wav"
                 tts.tts_to_file(text="dinliyorum seni", file_path=ack_wav)
                 rate, data = wav.read(ack_wav)
@@ -126,7 +121,7 @@ def main():
                 sd.play(data, samplerate=rate, device=output_id)
                 sd.wait()
 
-                # Kullanıcının Komutunu Kaydet
+                print("🔴 ŞİMDİ SORUNUZU SÖYLEYİN (5 saniye dinleniyor)...")
                 cmd_file = record_user_speech(duration=5, samplerate=16000, device_id=input_id)
                 with open(cmd_file, "rb") as file:
                     cmd_transcription = groq_client.audio.transcriptions.create(
@@ -140,11 +135,12 @@ def main():
                 print(f"🗣️ Komutunuz: \"{user_command}\"")
 
                 if not user_command:
+                    print("⚠️ Komut algılanamadı, dinlemeye dönülüyor.")
                     continue
 
                 messages_history.append({"role": "user", "content": user_command})
 
-                # LLM Cümle Cümle Akış (Streaming)
+                print("⚡ Groq Yanıt Üretiyor & Akış Yapılıyor...")
                 stream = groq_client.chat.completions.create(
                     messages=messages_history,
                     model="llama-3.3-70b-versatile",
@@ -192,7 +188,7 @@ def main():
                         sd.wait()
 
                 messages_history.append({"role": "assistant", "content": full_response})
-                print("\n👂 Tekrar 'Hey Groq' uyarısı bekleniyor...")
+                print("\n--------------------------------------------------")
 
         except Exception as e:
             print(f"⚠️ Hata: {e}")
