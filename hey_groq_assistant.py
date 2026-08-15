@@ -41,10 +41,13 @@ def find_respeaker():
                 in_id = i
             if dev['max_output_channels'] > 0 and out_id is None:
                 out_id = i
-    return in_id or sd.default.device[0], out_id or sd.default.device[1]
+    # 0 falsy olduğu için None karşılaştırması zorunlu
+    in_id  = in_id  if in_id  is not None else sd.default.device[0]
+    out_id = out_id if out_id is not None else sd.default.device[1]
+    return in_id, out_id
 
 
-def record_vad(device_id, max_secs=MAX_RECORD_SECS) -> np.ndarray:
+def record_vad(device_id, max_secs=MAX_RECORD_SECS, debug=False) -> np.ndarray:
     """
     VAD (Ses Aktivite Algılama) tabanlı dinamik kayıt.
     Konuşma başlayana kadar bekler, konuşma bitince durur.
@@ -54,12 +57,19 @@ def record_vad(device_id, max_secs=MAX_RECORD_SECS) -> np.ndarray:
     silent_chunks = 0
     speaking = False
     max_chunks = int(max_secs / CHUNK_SECS)
+    peak_rms = 0
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
                         dtype='int16', device=device_id, blocksize=chunk) as stream:
         for _ in range(max_chunks):
             data, _ = stream.read(chunk)
-            rms = np.sqrt(np.mean(data.astype(np.float32) ** 2))
+            rms = int(np.sqrt(np.mean(data.astype(np.float32) ** 2)))
+            peak_rms = max(peak_rms, rms)
+
+            if debug:
+                bar = '█' * min(int(rms / 100), 20)
+                sys.stdout.write(f"  🎙️  RMS: {rms:5d} [{bar:<20}] eşik={VAD_THRESHOLD}\r")
+                sys.stdout.flush()
 
             if rms > VAD_THRESHOLD:
                 speaking = True
@@ -69,8 +79,10 @@ def record_vad(device_id, max_secs=MAX_RECORD_SECS) -> np.ndarray:
                 frames.append(data)
                 silent_chunks += 1
                 if silent_chunks > (VAD_SILENCE_SECS / CHUNK_SECS):
-                    break  # Konuşma bitti
-            # Konuşma başlamadıysa bekle (sessizlik varsa kaydetme)
+                    break
+
+    if debug:
+        print(f"  📊 Peak RMS: {peak_rms}  |  Eşik: {VAD_THRESHOLD}")
 
     if not frames:
         return np.zeros((0, 1), dtype='int16')
@@ -179,9 +191,12 @@ def main():
     print(f"  🗣️  TTS Sesi  : {EDGE_TTS_VOICE}")
     print(f"  ⚡ LLM       : llama-3.3-70b-versatile (Groq)\n")
 
-    # Başlangıç sesi
+    # VAD Eşiği Kalibrasyonu
     print("  🔊 Ses testi...")
     edge_speak("Hazırım. Hey Groq diyerek başlayabilirsiniz.", out_id)
+    print("  🎚️  Mikrofon kalibrasyonu (3 saniye sessiz olun)...")
+    cal_audio = record_vad(in_id, max_secs=3, debug=True)
+    print("  ✅ Kalibrasyon tamamlandı.\n")
 
     messages = [
         {"role": "system",
@@ -190,14 +205,14 @@ def main():
                     "Çok uzun paragraflar yerine akıcı kısa paragraflar kullan."}
     ]
 
-    print("\n" + "─" * 60)
+    print("─" * 60)
     print("  👂 Wake-word bekleniyor... ('Hey Groq' deyin)")
     print("─" * 60)
 
     while True:
         try:
-            # 1. Wake-word: VAD ile dinamik kayıt
-            audio = record_vad(in_id, max_secs=4)
+            # 1. Wake-word: VAD ile dinamik kayıt (eşiği düşür ki duyulsun)
+            audio = record_vad(in_id, max_secs=4, debug=True)
             if audio.shape[0] < SAMPLE_RATE * 0.3:
                 continue
 
@@ -212,13 +227,10 @@ def main():
             os.unlink(wav_file)
             heard = str(result).strip().lower()
 
-            if not heard:
-                continue
-
-            # Debug: gerçekte ne duyulduğunu göster
-            print(f"\r  🔍 {heard:<60}", end="")
+            print(f"  🔍 Duyulan: '{heard}'")
 
             if not any(w in heard for w in WAKE_WORDS):
+                print("  ↩️  Wake-word yok, tekrar dinleniyor...\n")
                 continue
 
             # 2. Wake-word algılandı!
