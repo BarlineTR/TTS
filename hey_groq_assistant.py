@@ -21,6 +21,7 @@ os.environ["COQUI_TOS_AGREED"] = "1"
 
 # ─── Ayarlar ────────────────────────────────────────────────────────────────
 EDGE_TTS_VOICE = "tr-TR-AhmetNeural"
+EDGE_TTS_RATE = "+20%"
 SAMPLE_RATE = 16000
 WAKE_WORDS = [
     "hey groq", "hey grok", "hey grup", "hey krog", "hey crock",
@@ -34,8 +35,9 @@ CONVO_TIMEOUT_SECS = 15
 LLM_MODEL = "llama-3.3-70b-versatile"
 LLM_TEMPERATURE = 0.55
 LLM_MAX_TOKENS = 300
-TTS_MIN_CHARS = 35
-TTS_MAX_CHARS = 180
+TTS_MIN_CHARS = 70
+TTS_MAX_CHARS = 260
+TTS_PREFETCH = 3
 
 # ─── Audio ──────────────────────────────────────────────────────────────────
 # Ses çıkışını güvenilir tutuyoruz. Önceki sürümde MP3 pipe -> FFmpeg ->
@@ -180,7 +182,8 @@ def _edge_synthesize_sentence(text: str, out_id: int, generation: int):
             async def synthesize():
                 communicate = edge_tts.Communicate(
                     text,
-                    EDGE_TTS_VOICE
+                    EDGE_TTS_VOICE,
+                    rate=EDGE_TTS_RATE
                 )
                 await communicate.save(mp3_path)
 
@@ -316,55 +319,69 @@ def clean_tts_text(text: str) -> str:
 # ─── Cümle buffer ───────────────────────────────────────────────────────────
 def extract_tts_sentences(buffer: str, final=False):
     """
-    LLM streamini TTS parçalarına ayırır.
+    TTS için küçük cümleler yerine daha büyük doğal konuşma parçaları üretir.
 
-    Öncelik:
-      1. ? ! gibi güçlü bitişlerde hemen konuş.
-      2. Virgül/iki nokta gibi yerlerde buffer uzarsa böl.
-      3. Noktadan sonra uzun bir TTS duraklaması yaratmamak için
-         cümleleri gereksiz yere küçük parçalara ayırma.
+    Amaç:
+      "İyiyim, teşekkür ederim. Sana nasıl yardımcı olabilirim?"
+          -> tek TTS parçası
 
-    Not: TTS motorunun kendisi noktalama gördüğünde doğal prosodi uygular.
-    Bu nedenle TTS'ye çok kısa "parçalar" göndermek yerine makul uzunlukta
-    parçalar gönderiyoruz.
+      Uzun cevaplarda ise yaklaşık 2-3 cümlelik parçalar oluşturmak.
+
+    Böylece her nokta için yeni bir Edge-TTS isteği yapılmaz.
     """
     ready = []
-
     buffer = re.sub(r"\s+", " ", buffer).strip()
 
-    # Güçlü noktalama. Minimum karakter şartı yok.
+    # Güçlü bitişleri kontrol et. Ancak kısa parçayı hemen göndermiyoruz.
     while True:
-        match = re.search(r"^(.{8,}?[!?]+)(?:\s+|$)", buffer)
-
-        if not match:
+        matches = list(re.finditer(r"[.!?]+(?:\s+|$)", buffer))
+        if not matches:
             break
 
-        sentence = clean_tts_text(match.group(1))
-        if sentence:
-            ready.append(sentence)
+        # En az TTS_MIN_CHARS olacak şekilde en uygun cümle sonunu bul.
+        chosen = None
+        for m in matches:
+            candidate = buffer[:m.end()].strip()
+            if len(candidate) >= TTS_MIN_CHARS:
+                chosen = m
+                break
 
-        buffer = buffer[match.end():].lstrip()
+        if chosen is None:
+            break
 
-    # Nokta için daha erken tetikle.
-    # Böylece LLM cevabının ilk cümlesi için uzun süre beklemeyiz.
-    match = re.search(r"^(.{18,}?\.)\s+", buffer)
-    if match:
-        sentence = clean_tts_text(match.group(1))
-        if sentence:
-            ready.append(sentence)
-        buffer = buffer[match.end():].lstrip()
+        candidate = clean_tts_text(buffer[:chosen.end()].strip())
+        if candidate:
+            ready.append(candidate)
 
-    # Uzun buffer'da doğal bir kelime/virgül sınırından böl.
+        buffer = buffer[chosen.end():].lstrip()
+
+        # İlk parça yeterince büyükse ve kalan metin de varsa,
+        # her cümleyi ayrı ayrı göndermeyelim. Sonraki cümleleri
+        # mümkün olduğunca aynı buffer'da tutuyoruz.
+        if len(ready) >= 1 and len(buffer) < TTS_MAX_CHARS:
+            break
+
+    # Buffer fazla büyürse doğal bir sınırdan böl.
     if len(buffer) >= TTS_MAX_CHARS:
-        cut = max(
-            buffer.rfind(",", 0, TTS_MAX_CHARS),
-            buffer.rfind(" ", 0, TTS_MAX_CHARS)
-        )
+        cut_candidates = [
+            buffer.rfind(". ", 0, TTS_MAX_CHARS),
+            buffer.rfind("! ", 0, TTS_MAX_CHARS),
+            buffer.rfind("? ", 0, TTS_MAX_CHARS),
+            buffer.rfind(", ", 0, TTS_MAX_CHARS),
+            buffer.rfind(" ", 0, TTS_MAX_CHARS),
+        ]
 
-        if cut >= 35:
+        cut = max(cut_candidates)
+
+        if cut >= TTS_MIN_CHARS:
+            # Noktalama sınırında ise noktalamayı da dahil et.
+            if buffer[cut] in ".!?":
+                cut += 1
+
             sentence = clean_tts_text(buffer[:cut])
             if sentence:
                 ready.append(sentence)
+
             buffer = buffer[cut:].lstrip()
 
     if final and buffer:
@@ -378,59 +395,207 @@ def extract_tts_sentences(buffer: str, final=False):
 
 # ─── LLM + TTS Pipeline ─────────────────────────────────────────────────────
 def stream_and_speak_pipeline(groq_client, messages, out_id):
-    """LLM token stream -> sentence queue -> streaming TTS -> audio queue."""
+    """
+    Gerçek zamanlı LLM + paralel TTS pipeline.
+
+    Önceki sürüm:
+        LLM -> TTS 1 -> PLAY 1 -> TTS 2 -> PLAY 2 -> ...
+
+    Yeni sürüm:
+        LLM -> TTS 1 ───────────────┐
+             TTS 2 (prefetch) ─────┤
+             TTS 3 (prefetch) ─────┤
+                                    ↓
+                              PLAY 1 -> PLAY 2 -> PLAY 3
+
+    Böylece kullanıcı birinci parçayı dinlerken sonraki parçalar
+    arka planda hazırlanır.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
     full_response = ""
     text_buffer = ""
     generation = next_audio_generation()
-    tts_queue = queue.Queue(maxsize=4)
 
-    def tts_worker():
-        try:
-            while True:
-                sentence = tts_queue.get()
-                if sentence is None:
-                    break
-                print(f"\n  🔊 TTS: {sentence}")
-                speak_streaming(sentence, out_id, generation)
-        except Exception as exc:
-            print(f"\n  ⚠️ TTS worker: {exc}")
-
-    tts_thread = threading.Thread(target=tts_worker, daemon=True)
-    tts_thread.start()
-
-    stream = groq_client.chat.completions.create(
-        messages=messages,
-        model=LLM_MODEL,
-        temperature=LLM_TEMPERATURE,
-        max_tokens=LLM_MAX_TOKENS,
-        stream=True
+    # Aynı anda birkaç TTS isteğini hazırlıyoruz.
+    executor = ThreadPoolExecutor(
+        max_workers=TTS_PREFETCH,
+        thread_name_prefix="tts-prefetch"
     )
 
-    sys.stdout.write("  🤖 ")
-    sys.stdout.flush()
+    futures = []
+
+    def synthesize_to_wav(sentence, index):
+        """TTS sentezle, WAV dosyasını hazırla. Playback burada yapılmaz."""
+        mp3_path = None
+        wav_path = None
+
+        try:
+            mp3_file = tempfile.NamedTemporaryFile(
+                suffix=".mp3",
+                delete=False
+            )
+            wav_file = tempfile.NamedTemporaryFile(
+                suffix=".wav",
+                delete=False
+            )
+
+            mp3_path = mp3_file.name
+            wav_path = wav_file.name
+
+            mp3_file.close()
+            wav_file.close()
+
+            loop = asyncio.new_event_loop()
+
+            try:
+                asyncio.set_event_loop(loop)
+
+                async def synthesize():
+                    communicate = edge_tts.Communicate(
+                        sentence,
+                        EDGE_TTS_VOICE,
+                        rate=EDGE_TTS_RATE
+                    )
+                    await communicate.save(mp3_path)
+
+                loop.run_until_complete(synthesize())
+
+            finally:
+                loop.close()
+
+            with audio_generation_lock:
+                if generation != current_audio_generation:
+                    return None
+
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel", "error",
+                    "-i", mp3_path,
+                    "-ar", str(SAMPLE_RATE),
+                    "-ac", "1",
+                    "-f", "wav",
+                    wav_path
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE
+            )
+
+            if result.returncode != 0:
+                error_text = result.stderr.decode(
+                    "utf-8",
+                    errors="replace"
+                ).strip()
+                raise RuntimeError(
+                    f"FFmpeg TTS decode başarısız: {error_text}"
+                )
+
+            rate, data = wav.read(wav_path)
+
+            if data is None or len(data) == 0:
+                raise RuntimeError("TTS WAV verisi boş geldi.")
+
+            if data.dtype != np.int16:
+                data = data.astype(np.int16)
+
+            return rate, data.copy()
+
+        finally:
+            for path in (mp3_path, wav_path):
+                if path:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+
+    def submit_sentence(sentence):
+        sentence = clean_tts_text(sentence)
+
+        if not sentence:
+            return
+
+        index = len(futures)
+        print(f"\n  🔊 TTS hazırlanıyor #{index + 1}: {sentence}")
+
+        future = executor.submit(
+            synthesize_to_wav,
+            sentence,
+            index
+        )
+
+        futures.append((index, sentence, future))
+
     try:
+        stream = groq_client.chat.completions.create(
+            messages=messages,
+            model=LLM_MODEL,
+            temperature=LLM_TEMPERATURE,
+            max_tokens=LLM_MAX_TOKENS,
+            stream=True
+        )
+
+        sys.stdout.write("  🤖 ")
+        sys.stdout.flush()
+
         for chunk in stream:
             token = chunk.choices[0].delta.content or ""
+
             if not token:
                 continue
+
             full_response += token
             text_buffer += token
+
+            # Terminal çıktısını bozmadan göster.
             sys.stdout.write(token)
             sys.stdout.flush()
+
             sentences, text_buffer = extract_tts_sentences(text_buffer)
+
             for sentence in sentences:
-                sentence = clean_tts_text(sentence)
-                if sentence:
-                    tts_queue.put(sentence)
-        sentences, text_buffer = extract_tts_sentences(text_buffer, final=True)
+                submit_sentence(sentence)
+
+        # Son parçayı al.
+        sentences, text_buffer = extract_tts_sentences(
+            text_buffer,
+            final=True
+        )
+
         for sentence in sentences:
-            sentence = clean_tts_text(sentence)
-            if sentence:
-                tts_queue.put(sentence)
+            submit_sentence(sentence)
+
+        print()
+
+        # TTS'ler sırasını koruyarak oynatılır.
+        for index, sentence, future in futures:
+            try:
+                with audio_generation_lock:
+                    if generation != current_audio_generation:
+                        break
+
+                rate, data = future.result()
+
+                with audio_generation_lock:
+                    if generation != current_audio_generation:
+                        break
+
+                print(f"  🔊 Oynatılıyor #{index + 1}: {sentence}")
+
+                sd.play(
+                    data,
+                    samplerate=rate,
+                    device=out_id,
+                    blocking=True
+                )
+
+            except Exception as exc:
+                print(f"\n  ⚠️ TTS #{index + 1} hatası: {exc}")
+
     finally:
-        tts_queue.put(None)
-        tts_thread.join()
-    print()
+        executor.shutdown(wait=True, cancel_futures=True)
+
     return full_response
 
 
@@ -495,9 +660,7 @@ def main():
                 print("\n  ✅ Wake-word algılandı!")
                 in_conversation = True
                 last_interaction = time.time()
-                t_ack = threading.Thread(target=speak_once, args=("Dinliyorum.", out_id), daemon=True)
-                t_ack.start()
-                print("  🔴 Sorunuzu söyleyin...")
+                print("  🔴 Buyurun efendim...")
                 cmd_audio = record_vad(in_id, max_secs=MAX_RECORD_SECS)
             else:
                 elapsed = time.time() - last_interaction
