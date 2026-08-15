@@ -4,6 +4,8 @@ import asyncio
 import tempfile
 import threading
 import subprocess
+import time
+import queue
 import sounddevice as sd
 import scipy.io.wavfile as wav
 import numpy as np
@@ -16,211 +18,260 @@ if sys.platform == 'win32':
 
 os.environ["COQUI_TOS_AGREED"] = "1"
 
-EDGE_TTS_VOICE = "tr-TR-AhmetNeural"
-TARGET_SAMPLE_RATE = 16000
+# ─── Ayarlar ──────────────────────────────────────────────────────────────────
+EDGE_TTS_VOICE    = "tr-TR-AhmetNeural"   # tr-TR-EmelNeural (kadın ses)
+SAMPLE_RATE       = 16000
+WAKE_WORDS        = [
+    "hey groq", "hey grok", "hey grup", "hey krog", "hey crock",
+    "a groq", "a grok", "groq", "grok", "hi groq"
+]
+VAD_SILENCE_SECS  = 1.0    # Bu kadar sessizlik → konuşma bitti say
+VAD_THRESHOLD     = 500    # Ses amplitude eşiği (RMS)
+MAX_RECORD_SECS   = 8      # Maksimum kayıt süresi
+CHUNK_SECS        = 0.1    # Streaming blok boyutu
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-def find_respeaker_devices():
+def find_respeaker():
     devices = sd.query_devices()
-    input_id, output_id = None, None
+    in_id, out_id = None, None
     for i, dev in enumerate(devices):
         name = dev['name'].lower()
         if any(k in name for k in ["respeaker", "uac1", "seeed"]):
-            if dev['max_input_channels'] > 0 and input_id is None:
-                input_id = i
-            if dev['max_output_channels'] > 0 and output_id is None:
-                output_id = i
-    if input_id is None:
-        input_id = sd.default.device[0]
-    if output_id is None:
-        output_id = sd.default.device[1]
-    return input_id, output_id
+            if dev['max_input_channels'] > 0 and in_id is None:
+                in_id = i
+            if dev['max_output_channels'] > 0 and out_id is None:
+                out_id = i
+    return in_id or sd.default.device[0], out_id or sd.default.device[1]
 
 
-def record_audio(duration, samplerate=16000, device_id=0):
-    audio = sd.rec(int(duration * samplerate), samplerate=samplerate,
-                   channels=1, dtype='int16', device=device_id)
-    sd.wait()
+def record_vad(device_id, max_secs=MAX_RECORD_SECS) -> np.ndarray:
+    """
+    VAD (Ses Aktivite Algılama) tabanlı dinamik kayıt.
+    Konuşma başlayana kadar bekler, konuşma bitince durur.
+    """
+    chunk = int(SAMPLE_RATE * CHUNK_SECS)
+    frames = []
+    silent_chunks = 0
+    speaking = False
+    max_chunks = int(max_secs / CHUNK_SECS)
+
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                        dtype='int16', device=device_id, blocksize=chunk) as stream:
+        for _ in range(max_chunks):
+            data, _ = stream.read(chunk)
+            rms = np.sqrt(np.mean(data.astype(np.float32) ** 2))
+
+            if rms > VAD_THRESHOLD:
+                speaking = True
+                silent_chunks = 0
+                frames.append(data)
+            elif speaking:
+                frames.append(data)
+                silent_chunks += 1
+                if silent_chunks > (VAD_SILENCE_SECS / CHUNK_SECS):
+                    break  # Konuşma bitti
+            # Konuşma başlamadıysa bekle (sessizlik varsa kaydetme)
+
+    if not frames:
+        return np.zeros((0, 1), dtype='int16')
+    return np.concatenate(frames, axis=0)
+
+
+def audio_to_wav_file(audio_np: np.ndarray) -> str:
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    wav.write(tmp.name, samplerate, audio)
+    wav.write(tmp.name, SAMPLE_RATE, audio_np)
     return tmp.name
 
 
-def edge_synthesize(text, voice=EDGE_TTS_VOICE):
-    """Edge-TTS ile sentezle, MP3'ü WAV'a çevir, numpy array döndür"""
-    mp3_tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-    wav_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    mp3_tmp.close()
-    wav_tmp.close()
+def edge_speak(text: str, out_id: int):
+    """Edge-TTS ile sentezle → ffmpeg WAV → sounddevice ile çal"""
+    if not text.strip():
+        return
+    mp3 = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+    wav_f = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    mp3.close(); wav_f.close()
 
-    # Yeni event loop oluştur (threading içinde asyncio güvenli kullanım)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
     async def _synth():
-        communicate = edge_tts.Communicate(text, voice)
-        await communicate.save(mp3_tmp.name)
-
+        await edge_tts.Communicate(text, EDGE_TTS_VOICE).save(mp3.name)
     loop.run_until_complete(_synth())
     loop.close()
 
-    # MP3 → WAV (ffmpeg ile)
     subprocess.run(
-        ["ffmpeg", "-y", "-i", mp3_tmp.name,
-         "-ar", str(TARGET_SAMPLE_RATE), "-ac", "1", wav_tmp.name],
+        ["ffmpeg", "-y", "-i", mp3.name,
+         "-ar", str(SAMPLE_RATE), "-ac", "1", wav_f.name],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
-
-    rate, data = wav.read(wav_tmp.name)
-    os.unlink(mp3_tmp.name)
-    os.unlink(wav_tmp.name)
-    return rate, data
-
-
-def speak(text, output_id):
-    """Metni sentezle ve ReSpeaker kulaklığından çal"""
-    if not text.strip():
-        return
     try:
-        rate, data = edge_synthesize(text)
-        sd.play(data, samplerate=rate, device=output_id)
+        rate, data = wav.read(wav_f.name)
+        sd.play(data, samplerate=rate, device=out_id)
         sd.wait()
-    except Exception as e:
-        print(f"⚠️ TTS Hatası: {e}")
+    finally:
+        os.unlink(mp3.name)
+        os.unlink(wav_f.name)
+
+
+# ─── LLM Akışlı Yanıt + Eşzamanlı TTS ───────────────────────────────────────
+def stream_and_speak(groq_client, messages, out_id):
+    stream = groq_client.chat.completions.create(
+        messages=messages,
+        model="llama-3.3-70b-versatile",
+        temperature=0.7,
+        stream=True
+    )
+
+    full_response = ""
+    buffer = ""
+    play_thread = None
+
+    def play(sentence):
+        edge_speak(sentence, out_id)
+
+    for chunk in stream:
+        token = chunk.choices[0].delta.content or ""
+        full_response += token
+        buffer += token
+
+        if any(p in buffer for p in ['.', '?', '!', '\n']):
+            sentence = buffer.strip()
+            buffer = ""
+            if sentence:
+                print(f"  🤖 {sentence}")
+                if play_thread and play_thread.is_alive():
+                    play_thread.join()
+                play_thread = threading.Thread(target=play, args=(sentence,), daemon=True)
+                play_thread.start()
+
+    if buffer.strip():
+        if play_thread and play_thread.is_alive():
+            play_thread.join()
+        edge_speak(buffer.strip(), out_id)
+
+    if play_thread and play_thread.is_alive():
+        play_thread.join()
+
+    return full_response
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 def main():
-    print("==================================================")
-    print("⚡ Hey Groq! Ultra-Hızlı Asistan v3 (Edge-TTS + Groq Streaming)")
-    print("==================================================")
+    # Banner
+    print("\033[94m" + """
+  ██╗  ██╗███████╗██╗   ██╗     ██████╗ ██████╗  ██████╗  ██████╗
+  ██║  ██║██╔════╝╚██╗ ██╔╝    ██╔════╝ ██╔══██╗██╔═══██╗██╔═══██╗
+  ███████║█████╗   ╚████╔╝     ██║  ███╗██████╔╝██║   ██║██║   ██║
+  ██╔══██║██╔══╝    ╚██╔╝      ██║   ██║██╔══██╗██║   ██║██║▄▄ ██║
+  ██║  ██║███████╗   ██║       ╚██████╔╝██║  ██║╚██████╔╝╚██████╔╝
+  ╚═╝  ╚═╝╚══════╝   ╚═╝        ╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚══▀▀═╝
+  Jetson Sesli Asistan │ Edge-TTS + Groq Whisper + LLaMA 3.3
+    """ + "\033[0m")
 
     groq_api_key = os.environ.get("GROQ_API_KEY")
     if not groq_api_key:
-        groq_api_key = input("🔑 Groq API Key: ").strip()
+        groq_api_key = input("  🔑 Groq API Key: ").strip()
         os.environ["GROQ_API_KEY"] = groq_api_key
 
     groq_client = Groq(api_key=groq_api_key)
-    input_id, output_id = find_respeaker_devices()
-    print(f"🎤 Mikrofon ID: [{input_id}] | 🎧 Kulaklık ID: [{output_id}]")
-    print(f"🗣️ TTS: {EDGE_TTS_VOICE} (Microsoft Edge)")
+    in_id, out_id = find_respeaker()
 
-    # TTS testi - ses çıkışını doğrula
-    print("\n🔊 Ses testi yapılıyor...")
-    speak("Sistem hazır. Hey Groq diyerek başlayabilirsiniz.", output_id)
-    print("✅ Ses testi tamamlandı! 'Hey Groq' diyerek başlayın.\n")
+    print(f"  🎤 Mikrofon  : [{in_id}]  |  🎧 Kulaklık : [{out_id}]")
+    print(f"  🗣️  TTS Sesi  : {EDGE_TTS_VOICE}")
+    print(f"  ⚡ LLM       : llama-3.3-70b-versatile (Groq)\n")
 
-    wake_words = [
-        "hey groq", "hey grup", "hey krog", "hi groq",
-        "groq", "grok", "hey grok", "heygroq", "a groq", "a grok"
+    # Başlangıç sesi
+    print("  🔊 Ses testi...")
+    edge_speak("Hazırım. Hey Groq diyerek başlayabilirsiniz.", out_id)
+
+    messages = [
+        {"role": "system",
+         "content": "Sen zeki, samimi ve bilgili bir sesli asistansın. "
+                    "Türkçe konuş. Sorulara eksiksiz, doğal ve akıcı cevaplar ver. "
+                    "Çok uzun paragraflar yerine akıcı kısa paragraflar kullan."}
     ]
 
-    messages_history = [
-        {
-            "role": "system",
-            "content": "Sen zeki, samimi ve bilgili bir sesli asistansın. Türkçe konuş. Sorulara eksiksiz, doğal ve akıcı cevaplar ver."
-        }
-    ]
+    print("\n" + "─" * 60)
+    print("  👂 Wake-word bekleniyor... ('Hey Groq' deyin)")
+    print("─" * 60)
 
     while True:
         try:
-            # 1. Sürekli Wake-Word Dinleme
-            sys.stdout.write("\r👂 Dinleniyor... ('Hey Groq' deyin)        ")
-            sys.stdout.flush()
+            # 1. Wake-word: VAD ile dinamik kayıt
+            audio = record_vad(in_id, max_secs=4)
+            if audio.shape[0] < SAMPLE_RATE * 0.3:
+                continue
 
-            chunk_file = record_audio(duration=2.5, device_id=input_id)
-            with open(chunk_file, "rb") as f:
-                transcription = groq_client.audio.transcriptions.create(
-                    file=(chunk_file, f.read()),
+            wav_file = audio_to_wav_file(audio)
+            with open(wav_file, "rb") as f:
+                result = groq_client.audio.transcriptions.create(
+                    file=(wav_file, f.read()),
                     model="whisper-large-v3",
                     language="tr",
                     response_format="text"
                 )
-            os.unlink(chunk_file)
-            heard = str(transcription).strip().lower()
+            os.unlink(wav_file)
+            heard = str(result).strip().lower()
 
-            if heard:
-                sys.stdout.write(f"\r🔍 Duyulan: '{heard}'                              ")
-                sys.stdout.flush()
-
-            # 2. Wake-Word Kontrolü
-            if not any(w in heard for w in wake_words):
+            if not heard:
                 continue
 
-            print(f"\n✨ Wake-word algılandı! ('{heard}')")
+            # Debug: gerçekte ne duyulduğunu göster
+            print(f"\r  🔍 {heard:<60}", end="")
 
-            # 3. Onay sesi (arka planda sentezlerken kayıt başlasın)
-            print("🔴 Sorunuzu söyleyin (5 saniye)...")
-            ack_thread = threading.Thread(target=speak, args=("Dinliyorum.", output_id))
-            ack_thread.start()
+            if not any(w in heard for w in WAKE_WORDS):
+                continue
 
-            # "Dinliyorum" çalarken kullanıcı komutunu da kaydet
-            cmd_file = record_audio(duration=5, device_id=input_id)
-            ack_thread.join()  # Onay sesi bitmeden çakışma olmasın
+            # 2. Wake-word algılandı!
+            print(f"\n\n  ✅ Wake-word → '{heard}'")
+            print("─" * 60)
 
+            # "Dinliyorum" sesini çalarken VAD ile kullanıcıyı dinlemeye başla
+            t_speak = threading.Thread(
+                target=edge_speak, args=("Dinliyorum.", out_id), daemon=True
+            )
+            t_speak.start()
+
+            print("  🔴 Sorunuzu söyleyin...")
+            cmd_audio = record_vad(in_id, max_secs=MAX_RECORD_SECS)
+            t_speak.join()
+
+            if cmd_audio.shape[0] < SAMPLE_RATE * 0.3:
+                edge_speak("Duymadım, tekrar söyler misiniz?", out_id)
+                continue
+
+            # 3. Komutu transkribe et
+            cmd_file = audio_to_wav_file(cmd_audio)
             with open(cmd_file, "rb") as f:
-                cmd_trans = groq_client.audio.transcriptions.create(
+                cmd_result = groq_client.audio.transcriptions.create(
                     file=(cmd_file, f.read()),
                     model="whisper-large-v3",
                     language="tr",
                     response_format="text"
                 )
             os.unlink(cmd_file)
-            user_command = str(cmd_trans).strip()
+            user_text = str(cmd_result).strip()
 
-            if not user_command:
-                speak("Anlamadım, tekrar dener misiniz?", output_id)
+            if not user_text:
+                edge_speak("Anlayamadım, tekrar dener misiniz?", out_id)
                 continue
 
-            print(f"🗣️ Siz: \"{user_command}\"")
-            messages_history.append({"role": "user", "content": user_command})
+            print(f"  🗣️  Siz  : \"{user_text}\"")
+            messages.append({"role": "user", "content": user_text})
 
-            # 4. Groq LLM Streaming + Paralel Edge-TTS
-            stream = groq_client.chat.completions.create(
-                messages=messages_history,
-                model="llama-3.3-70b-versatile",
-                temperature=0.7,
-                stream=True
-            )
+            # 4. LLM Streaming + Paralel TTS
+            print("  🤖 Asistan:")
+            full = stream_and_speak(groq_client, messages, out_id)
+            messages.append({"role": "assistant", "content": full})
 
-            full_response = ""
-            sentence_buffer = ""
-            play_thread = None
-
-            for chunk in stream:
-                content = chunk.choices[0].delta.content or ""
-                full_response += content
-                sentence_buffer += content
-
-                if any(p in sentence_buffer for p in ['.', '?', '!', '\n']):
-                    sentence = sentence_buffer.strip()
-                    sentence_buffer = ""
-                    if sentence:
-                        print(f"🤖 {sentence}")
-                        # Önceki cümle bitsin
-                        if play_thread and play_thread.is_alive():
-                            play_thread.join()
-                        # Yeni cümleyi arka planda çal
-                        play_thread = threading.Thread(
-                            target=speak, args=(sentence, output_id)
-                        )
-                        play_thread.start()
-
-            if sentence_buffer.strip():
-                if play_thread and play_thread.is_alive():
-                    play_thread.join()
-                speak(sentence_buffer.strip(), output_id)
-
-            if play_thread and play_thread.is_alive():
-                play_thread.join()
-
-            messages_history.append({"role": "assistant", "content": full_response})
-            print("\n--------------------------------------------------")
+            print("\n" + "─" * 60)
+            print("  👂 Dinleniyor... ('Hey Groq' deyin)")
+            print("─" * 60)
 
         except KeyboardInterrupt:
-            print("\n👋 Görüşmek üzere!")
+            print("\n\n  👋 Görüşmek üzere!\n")
             break
         except Exception as e:
-            print(f"\n⚠️ Hata: {e}")
+            print(f"\n  ⚠️ Hata: {e}")
 
 
 if __name__ == "__main__":
