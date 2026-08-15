@@ -84,7 +84,7 @@ def main():
         }
     ]
 
-    wake_words = ["hey groq", "hey grup", "hey krog", "hi groq", "groq", "grup", "grok", "hey grok"]
+    wake_words = ["hey groq", "hey grup", "hey krog", "hi groq", "groq", "grup", "grok", "hey grok", "hey grock", "hey", "hey grok"]
 
     while True:
         try:
