@@ -4,6 +4,7 @@ import torch
 import sounddevice as sd
 import numpy as np
 import scipy.io.wavfile as wav
+from scipy.signal import resample
 from TTS.api import TTS
 
 if sys.platform == 'win32':
@@ -25,7 +26,6 @@ def find_respeaker_devices():
             if dev['max_output_channels'] > 0 and output_id is None:
                 output_id = i
                 
-    # Bulunamazsa varsayılan cihazları seç
     if input_id is None:
         input_id = sd.default.device[0]
     if output_id is None:
@@ -43,13 +43,13 @@ def main():
     print(f"🎧 Çıktı Cihazı (ReSpeaker Headphone): ID [{output_id}]")
     
     print("\n🧠 Türkçe TTS Modeli Yükleniyor (Lütfen Bekleyin)...")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     tts = TTS(model_name="tts_models/tr/common-voice/glow-tts", progress_bar=False, gpu=torch.cuda.is_available())
     
     print("\n✅ Model Yüklendi! Artık modelle konuşabilir ve yazışabilirsiniz.")
     print("💡 Çıkmak için 'q' veya 'exit' yazabilirsiniz.\n")
     
     output_wav = "interactive_output.wav"
+    target_sample_rate = 16000  # ReSpeaker donanımının desteklediği standart örnekleme oranı (16kHz / 48kHz)
     
     while True:
         try:
@@ -65,8 +65,15 @@ def main():
             print("🗣️  Ses Sentezleniyor...")
             tts.tts_to_file(text=text, file_path=output_wav)
             
-            # Sesi ReSpeaker Kulaklığından Oynat
+            # Ses dosyasını oku
             rate, data = wav.read(output_wav)
+            
+            # ReSpeaker kulaklığı için 22050Hz sesini 16000Hz'e yeniden örnekle (Resample)
+            if rate != target_sample_rate:
+                num_samples = int(len(data) * target_sample_rate / rate)
+                data = resample(data, num_samples).astype(data.dtype)
+                rate = target_sample_rate
+            
             print("🔊 ReSpeaker Kulaklığına Ses Aktarılıyor...\n")
             sd.play(data, samplerate=rate, device=output_id)
             sd.wait()
