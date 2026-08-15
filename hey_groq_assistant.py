@@ -267,28 +267,112 @@ def speak_once(text: str, out_id: int):
     speak_streaming(text, out_id, generation)
 
 
+# ─── TTS metin temizleme ─────────────────────────────────────────────────────
+# LLM'nin ürettiği emoji, markdown ve TTS'nin gereksiz yere seslendireceği
+# biçimlendirme karakterlerini temizler.
+EMOJI_RE = re.compile(
+    "["
+    "\U0001F1E0-\U0001F1FF"
+    "\U0001F300-\U0001F5FF"
+    "\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\u2600-\u26FF"
+    "\u2700-\u27BF"
+    "]+",
+    flags=re.UNICODE
+)
+
+def clean_tts_text(text: str) -> str:
+    """TTS'ye gitmeden önce emoji/markdown ve gereksiz durakları temizle."""
+    if not text:
+        return ""
+
+    # Emoji'leri kaldır.
+    text = EMOJI_RE.sub("", text)
+
+    # Markdown kalıntıları.
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"__(.*?)__", r"\1", text)
+    text = re.sub(r"[*_#~]+", " ", text)
+
+    # Emoji temizliğinden sonra oluşan boşlukları toparla.
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # TTS'nin gereksiz uzun duraklamasına neden olabilecek noktalama.
+    # Noktayı tamamen silmiyoruz, çünkü cümle yapısını korumak gerekiyor.
+    text = re.sub(r"\.{2,}", ".", text)
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+
+    return text.strip()
+
+
 # ─── Cümle buffer ───────────────────────────────────────────────────────────
 def extract_tts_sentences(buffer: str, final=False):
+    """
+    LLM streamini TTS parçalarına ayırır.
+
+    Öncelik:
+      1. ? ! gibi güçlü bitişlerde hemen konuş.
+      2. Virgül/iki nokta gibi yerlerde buffer uzarsa böl.
+      3. Noktadan sonra uzun bir TTS duraklaması yaratmamak için
+         cümleleri gereksiz yere küçük parçalara ayırma.
+
+    Not: TTS motorunun kendisi noktalama gördüğünde doğal prosodi uygular.
+    Bu nedenle TTS'ye çok kısa "parçalar" göndermek yerine makul uzunlukta
+    parçalar gönderiyoruz.
+    """
     ready = []
-    buffer = buffer.replace("\n\n", " ")
-    buffer = re.sub(r"\s+", " ", buffer)
+
+    buffer = re.sub(r"\s+", " ", buffer).strip()
+
+    # Güçlü noktalama. Minimum karakter şartı yok.
     while True:
-        match = re.search(r"^(.{%d,}?[.!?…]+)(?:\s+|$)" % TTS_MIN_CHARS, buffer)
+        match = re.search(r"^(.{8,}?[!?]+)(?:\s+|$)", buffer)
+
         if not match:
             break
-        sentence = match.group(1).strip()
+
+        sentence = clean_tts_text(match.group(1))
+        if sentence:
+            ready.append(sentence)
+
+        buffer = buffer[match.end():].lstrip()
+
+    # Nokta için daha erken tetikle.
+    # Böylece LLM cevabının ilk cümlesi için uzun süre beklemeyiz.
+    match = re.search(r"^(.{18,}?\.)\s+", buffer)
+    if match:
+        sentence = clean_tts_text(match.group(1))
         if sentence:
             ready.append(sentence)
         buffer = buffer[match.end():].lstrip()
+
+    # Uzun buffer'da doğal bir kelime/virgül sınırından böl.
     if len(buffer) >= TTS_MAX_CHARS:
-        cut = max(buffer.rfind(",", 0, TTS_MAX_CHARS),
-                   buffer.rfind(" ", 0, TTS_MAX_CHARS))
-        if cut >= TTS_MIN_CHARS:
-            ready.append(buffer[:cut].strip())
+        cut = max(
+            buffer.rfind(",", 0, TTS_MAX_CHARS),
+            buffer.rfind(" ", 0, TTS_MAX_CHARS)
+        )
+
+        if cut >= 35:
+            sentence = clean_tts_text(buffer[:cut])
+            if sentence:
+                ready.append(sentence)
             buffer = buffer[cut:].lstrip()
-    if final and buffer.strip():
-        ready.append(buffer.strip())
+
+    if final and buffer:
+        sentence = clean_tts_text(buffer)
+        if sentence:
+            ready.append(sentence)
         buffer = ""
+
     return ready, buffer
 
 
@@ -335,10 +419,14 @@ def stream_and_speak_pipeline(groq_client, messages, out_id):
             sys.stdout.flush()
             sentences, text_buffer = extract_tts_sentences(text_buffer)
             for sentence in sentences:
-                tts_queue.put(sentence)
+                sentence = clean_tts_text(sentence)
+                if sentence:
+                    tts_queue.put(sentence)
         sentences, text_buffer = extract_tts_sentences(text_buffer, final=True)
         for sentence in sentences:
-            tts_queue.put(sentence)
+            sentence = clean_tts_text(sentence)
+            if sentence:
+                tts_queue.put(sentence)
     finally:
         tts_queue.put(None)
         tts_thread.join()
@@ -381,7 +469,9 @@ def main():
             "Sen hızlı ve doğal konuşan bir Türkçe sesli asistansın. "
             "Cevaplarını konuşmaya uygun üret. Gereksiz uzun açıklamalar yapma. "
             "Önce doğrudan sonucu söyle, gerekirse kısa açıklama ekle. "
-            "Markdown, tablo, kod bloğu ve emoji kullanma."
+            "Markdown, tablo, kod bloğu ve emoji kullanma. "
+                "Emoji, sembol veya yüz ifadesi üretme; konuşma için yalnızca "
+                "normal Türkçe metin kullan."
         )
     }]
 
